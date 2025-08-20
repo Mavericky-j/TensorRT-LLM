@@ -4893,6 +4893,72 @@ def enumerate_hmma_flash_kernels_base(specs,
                     enable_attn_logit_softcapping=enable_attn_logit_softcapping)
             )
 
+# Note this will be used in TRT-Edge-LLM.
+def enumerate_hmma_flash_kernels_edge_llm(specs,
+                                      sm=80,
+                                      dtype='fp16',
+                                      input_layout=InputLayout.PACKED_QKV,
+                                      enable_attn_logit_softcapping=False,
+                                      head_size_v=0):
+    #- FP16 Flash Attention (use nl as default)
+    # Any Sequence Length H = 64/128 flash attention
+
+    # Note: sm70, sm72 are based on hmma8x8x4, while sm75+ is based on hmma16x8x16
+    # sm75 and sm80+ use the same underlying trait class; but for historical reasons we prefer not
+    # to change the appearance of the trait class. So:
+    #  - Volta uses Volta_hmma_fp16_traits
+    #  - Turing uses Turing_hmma_fp16_traits
+    #  - Ampere uses Ampere_hmma_fp16_traits but is effectively an alias of Turing_hmma_fp16_traits
+    #  - Ada, Hopper and Blackwell use Ampere_hmma_fp16_traits
+
+    sm_mma = 0
+    if sm in [70, 72]:
+        sm_mma = 70
+    elif sm in [75]:
+        sm_mma = 75
+    elif sm in [80, 86, 87, 89, 90, 100, 120, 101, 121]:
+        sm_mma = 80
+
+    # _nl_tiled kernels; higher precedence than _nl kernels
+    # params[head_size] = [q_step, kv_step]
+    tiled_head_dim_q_kv_step = [
+        [0, 64, 64, 32],
+        [0, 128, 64, 32],
+        [1, 128, 64, 128],
+    ]
+    for (tiled, head_size, q_loop_step,
+                    kv_loop_step) in tiled_head_dim_q_kv_step:
+        specs.append(
+            kernel_spec(
+                sm=sm,
+                sm_mma=sm_mma,
+                dtype=dtype,
+                flash_attention=True,
+                tiled=tiled,
+                seq_len=0,  # means any sequence here
+                kv_loop_step=kv_loop_step,
+                limit_qk_fragments=False,
+                limit_v_fragments=False,
+                head_size=head_size,
+                head_size_v=head_size_v,
+                warps_m=4,
+                warps_n=1,
+                version=2,
+                interleaved=False,
+                ldgsts_q=True,
+                ldgsts_k=True,
+                ldgsts_v=True,
+                share_smem_k_v=False,
+                loop_step=q_loop_step,
+                has_noloop=1,
+                noloop_step=q_loop_step,
+                unroll_threshold=1,
+                has_scale_max=False,
+                ctas_per_head=1,
+                input_layout=input_layout,
+                enable_attn_logit_softcapping=enable_attn_logit_softcapping,
+                is_mtp=False))
+
 
 def enumerate_qgmma_kernels(specs, sm=90):
     specs.append(
@@ -6150,6 +6216,27 @@ def enumerate_kernels():
     # TODO we have to select the unroll_threshold over a grid of b and h for each arch
 
     # Current fp16 384 kernel does 1x8 (smem limit), STEP=48. FP16 does not currently have noloop.
+
+    if 'GENERATE_EDGE_LLM' in os.environ:
+        if "ENABLE_SM12X" in os.environ:
+            sm_list = [120, 121]
+        else:
+            sm_list = [80, 86, 89, 87, 101]
+
+        for sm in sm_list:
+            for input_layout in [InputLayout.PACKED_QKV]:
+                enumerate_hmma_flash_kernels_edge_llm(specs, sm=sm, dtype='fp16', input_layout=input_layout)
+
+        # TRT-EdgeLLM uses the head_interleaved=False mode.
+        if 'GENERATE_CUBIN' in os.environ:
+            specs_expanded = [
+                kspec._replace(head_interleaved=False) for kspec in specs
+            ]
+        # yapf: disable
+        specs_names = [(kspec, *encode_name(kspec)) for kspec in specs]
+
+        generate_files(specs_names)
+        return
 
     # SM 90
     enumerate_hgmma_tma_kernels(specs, sm=90)
